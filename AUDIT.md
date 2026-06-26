@@ -15,10 +15,12 @@ Le projet souffre cependant de plusieurs **bugs fonctionnels avérés** (paramè
 | Sévérité | Nombre (indicatif) |
 |----------|--------|
 | 🔴 Élevée (bug fonctionnel) | 8 |
-| 🟠 Moyenne | 14 |
-| 🟡 Faible | 16 |
+| 🟠 Moyenne | 18 |
+| 🟡 Faible | 17 |
 
-> Comptes indicatifs. **3.3** est rédigé comme un bug 🔴 (plantage de `get_search_datas` sur toute réponse ≠ 200) mais reste classé en §3 ; il **n'est pas inclus** dans les 8 du §2. Le total réel de bugs critiques est donc **9**.
+> Comptes indicatifs. **3.3** et **3.22** sont rédigés comme des bugs 🔴 (respectivement : plantage de `get_search_datas` sur toute réponse ≠ 200 ; rejet 422 silencieux sur langue ISO 639-3) mais restent classés en §3 ; ils **ne sont pas inclus** dans les 8 du §2. Le total réel de bugs critiques est donc **10**.
+>
+> **Mise à jour (2026-06-25)** — les findings **3.22 à 3.24** sont issus d'un **croisement avec le savoir Nakala validé en live** d'un projet frère (ColleC / `archives_tool`), qui a sondé l'API en écriture (apitest + parité prod) bien au-delà de la spec Swagger. Référence : `ColleC/docs/developpeurs/nakala-savoir-api.md` et l'audit croisé `…/nakala-audit-croise-nakalapycon.md`.
 
 ---
 
@@ -172,6 +174,12 @@ target = r" *(?P<surname>[\w\- ]*) *, *(?P<givenname>[\w\- ]*) *(@(?P<orcid>[\w\
 
 Selon le format réellement saisi par l'utilisateur, prénom et nom seront **intervertis** dans le JSON envoyé à Nakala. Aligner la regex sur le docstring (ou inversement) et ajouter un test.
 
+**Confirmé empiriquement (§8.8).** Exécution de la regex : `"Dupont, Pierre"` → `surname="Dupont", givenname="Pierre"` (la regex lit donc **« Nom, Prénom »**, à l'opposé du docstring « prénom, nom »). L'API Nakala modélise le créateur comme `Author = {givenname, surname}` (champs **obligatoires**, vérifié sur données réelles : `{"givenname":"Claudie","surname":"Marcel-Dubois"}`), et construit `fullName = givenname + " " + surname`. Deux effets de bord supplémentaires mesurés :
+- **`@orcid` laisse une espace parasite** dans `givenname` (`"Victor "` — pas de `.strip()`).
+- **Sans virgule, le créateur est silencieusement perdu** : `"Marie Curie"` ne *matche* pas → `not found`, créateur omis sans erreur.
+
+**Site vs API** : via le formulaire du site, prénom et nom sont saisis dans **deux champs distincts** → aucune inversion possible ; via NakalaPycon, le découpage d'une chaîne unique par la regex peut **permuter** les deux (ou omettre le créateur). Le format **stocké** est identique des deux côtés (`{givenname, surname}`) ; la divergence vient uniquement du pré-traitement de la librairie.
+
 ### 3.12 🟡 `get_search_datas` n'expose pas la pagination (pourtant disponible)
 **Vérifié sur la spec** (§8.4) : `GET /search` accepte `page` et **`size`** (et non `limit`). Or [nklAPI_Search.py:16](nakalapycon/src/nklAPI_Search.py#L16) n'expose **aucun** de ces paramètres → impossible de parcourir les résultats au-delà de la première page. (De même, `searchOperator`/`searchField` de `/authors/search` ne sont pas exposés.) À ajouter.
 
@@ -213,6 +221,67 @@ Confirmé par `/vocabularies/metadatatypes` (§8.5) : Nakala propose **`http://p
 
 ### 3.18 🟡 Docstring `post_datas_rights` : `ROLE_OWNER` listé comme rôle assignable
 [nklAPI_Datas.py:866](nakalapycon/src/nklAPI_Datas.py#L866) annonce « ROLE_OWNER, ROLE_ADMIN, ROLE_EDITOR, ROLE_READER ». Or l'enum `Role` de la spec (corps des POST de droits sur data) = **`[ROLE_ADMIN, ROLE_EDITOR, ROLE_READER]`** (§8.7) ; `ROLE_OWNER` n'est pas assignable via l'API (le propriétaire ne s'attribue pas). Corriger le docstring.
+
+### 3.19 🟠 `collectionDatasToDf` — aplatissement à perte des créateurs (`creators_formated`)
+[nklPullCorpus.py:136](nakalapycon/src/nklPullCorpus.py#L136) construit l'auteur comme
+`formattedName = meta['value']['givenname'] + " " + meta['value']['surname']`, stocké dans la
+colonne unique `creators_formated` (et plusieurs auteurs sont **concaténés** dans la même
+cellule, séparés par `, ` — [:141](nakalapycon/src/nklPullCorpus.py#L141), [:146](nakalapycon/src/nklPullCorpus.py#L146)).
+
+Cette fusion en une chaîne **détruit la structure** renvoyée par Nakala :
+
+| Champ Nakala | Sort dans le DataFrame ? |
+|--------------|--------------------------|
+| `givenname` / `surname` (séparés) | fondus dans une seule chaîne |
+| `orcid` | **perdu** |
+| `authorId` (identité dédoublonnée, cf. §8.9) | **perdu** |
+| N auteurs distincts | **fusionnés** en une cellule |
+
+Conséquences :
+- **Tout index/tri sur `creators_formated` part du prénom** (la chaîne commence par `givenname`) → impossible de classer par nom de famille sans re-parser. C'est l'« index par prénom » observé.
+- **Dédoublonnage d'auteur impossible** (`authorId` jeté) ; **ORCID inexploitable**.
+- N.B. : ce champ **reflète** fidèlement les données — il n'introduit pas d'inversion ; il *expose* celles déjà présentes dans Nakala (cf. §8.10) tout en perdant le moyen de les corriger/trier.
+
+**Recommandation** : ne pas aplatir — exposer des colonnes séparées (`creator_givenname`,
+`creator_surname`, `creator_orcid`, `creator_authorId`) et gérer le multi-auteur en lignes ou
+liste structurée ; dériver éventuellement une colonne d'affichage « Nom, Prénom » par-dessus,
+sans perte. Lien : 3.11, 3.16.
+
+Robustesse : la garde `if not (meta['value']==None)` [nklPullCorpus.py:133](nakalapycon/src/nklPullCorpus.py#L133)
+évite une `TypeError` quand `value` est `null` (cas réel, cf. §8.10), mais l'enregistrement
+ressort alors **sans auteur** (`creators_formated` vide) — perte silencieuse à documenter.
+
+### 3.20 🟠 Pagination de `/search` : `lastPage`/`currentPage` absents (boucle de corpus inopérante)
+**Vérifié en direct (§8.11)** : `GET /search` accepte bien `page` et `size` (testé jusqu'à `size=10000`, pages distinctes), **mais la réponse ne contient ni `lastPage` ni `currentPage`** (tous deux `null`) — seul `totalResults` est fourni. Or le motif de pagination employé ailleurs dans la lib (`collectionDatasToDf`, `put_collections_datas_rights`) repose sur `dictVals['lastPage']`. Si l'on bâtit une extraction paginée de corpus sur `/search` selon ce même motif, la boucle **ne peut pas se terminer correctement** (clé absente). Pour `/search`, paginer via `totalResults` + `size` (calcul du nombre de pages) ou via `size` large en une passe. À distinguer de `/collections/{id}/datas`, qui **fournit** `lastPage` (d'où la cohérence du code existant sur les collections).
+
+### 3.21 🟡 IIIF : `size="full"` déprécié en IIIF Image API 3.0
+**Vérifié (§8.11)** : `GET /iiif/{id}/{sha1}/info.json` renvoie `@context = http://iiif.io/api/image/3/context.json` → Nakala sert l'**Image API 3.0**. Or `getImageUrlIIIF` ([nklPullCorpus.py:247](nakalapycon/src/nklPullCorpus.py#L247)) et son exemple/test ([test_nklPullCorpus.py:92](nakalapycon/src/test_nklPullCorpus.py#L92)) utilisent `size="full"`, **déprécié en 3.0** (remplacé par `max`). L'URL fonctionne encore aujourd'hui (compatibilité ascendante : test renvoie un JPEG valide, §8.11) mais c'est fragile. Privilégier `max`. Bénin tant que le serveur tolère `full`.
+
+### 3.22 🔴 Langue non convertie en RFC5646 — rejet 422 silencieux sur les codes ISO 639-3
+[nklDf2Dic.py:151-158](nakalapycon/src/nklDf2Dic.py#L151-L158) ; chemins « dict brut » `post_datas`/`put_datas`/`post_datas_metadatas`
+
+**Constat croisé (savoir live ColleC, `nakala-savoir-api.md` §5).** Nakala type `dcterms:language` en **RFC5646 / ISO 639-1** (`fr`, `es`, `en`) pour les langues majeures et réserve l'**ISO 639-3** à la longue traîne. Déposer un code 639-3 (`spa`, `fra`, `eng`) → **rejet `422`** (« unauthorized »). Or NakalaPycon ne fait **aucune** conversion de langue :
+
+- chemin tableur : la `lang` est recopiée brute depuis la colonne `Nkl-lang` ([nklDf2Dic.py:151-158](nakalapycon/src/nklDf2Dic.py#L151-L158)) ;
+- chemins « dictionnaire brut » : la `lang` fournie par l'appelant part telle quelle dans le JSON.
+
+**Pourquoi c'est un piège réel.** La librairie expose `get_vocabularies_languages` ([nklAPI_Vocabularies.py](nakalapycon/src/nklAPI_Vocabularies.py)) → le endpoint `/vocabularies/languages`, dont les `id` sont en **639-3 pour la longue traîne**. Un appelant qui pioche un `id` de langue dans cette sortie et le place dans une meta `lang` **obtient un 422** sans aucun indice. Les exemples/tests actuels utilisent `"fr"`/`"en"` (valides RFC5646) → le piège est **invisible aux tests** mais bien présent à l'usage réel multilingue.
+
+**Interaction avec 2.6.** Sur le chemin tableur, le bug 2.6 (test de langue toujours faux, [nklDf2Dic.py:154](nakalapycon/src/nklDf2Dic.py#L154)) fait que la `lang` n'est **actuellement jamais affectée** (reste `""`) → le rejet 422 y est *masqué*. **Le jour où 2.6 est corrigé, ce piège se réveille.** Sur les chemins « dict brut », il bite déjà. Correctif : convertir 639-3 → 639-1 avant envoi (pont `langue_vers_nakala`, comme côté ColleC), sur la valeur **et** l'attribut `lang`.
+
+### 3.23 🟠 `put_datas` — sémantique « `files[]` = remplacement total » non documentée (perte silencieuse)
+[nklAPI_Datas.py:91-123](nakalapycon/src/nklAPI_Datas.py#L91-L123)
+
+**Constat croisé (savoir live ColleC, `nakala-savoir-api.md` §8, hypothèse H1).** `PUT /datas/{id}` a une sémantique **« remplace »**, pas « ajoute » : envoyer une clé `files` **partielle** **supprime** les fichiers omis. (Confirmé aussi par H12 : même le champ `description` d'un `files[i]` omis au PUT est **effacé**.) Or `put_datas` ([nklAPI_Datas.py:91](nakalapycon/src/nklAPI_Datas.py#L91)) transmet `dictVals` **brut** et sa docstring décrit « les informations à modifier » **sans jamais avertir** de ce risque. Un appelant voulant « changer un fichier » via `{"files":[{nouveau}]}` **efface tous les autres** — sans erreur.
+
+Aggravant : la librairie n'offre aucun chemin granulaire **sûr** en regard — `delete_datas_files` est cassé (URL polluée par U+200B **et** code testé `200` au lieu de `204`, cf. 2.4) et `post_datas_files` (additif, → 200) n'est pas présenté comme la voie de modification sûre. Recommandation : a minima documenter le danger dans la docstring de `put_datas` ; idéalement, exposer/fiabiliser un push **granulaire** (POST additif → DELETE ciblé → PUT de réordonnancement reconstruit depuis l'état distant relu), à l'image de ColleC.
+
+### 3.24 🟠 `post_datas_metadatas` — POST sur un champ scalaire crée un doublon (non documenté)
+[nklAPI_Datas.py:633-661](nakalapycon/src/nklAPI_Datas.py#L633-L661)
+
+**Constat croisé (savoir live ColleC, `nakala-savoir-api.md` §2, sondé 2026-06-19).** `POST /datas/{id}/metadatas` est **additif**. Sur une propriété **scalaire** (`nkl:title`), il **ne remplace pas — il crée un DOUBLON** (la donnée se retrouve avec deux titres). Modifier un scalaire impose **DELETE puis POST**. Or `post_datas_metadatas` ([nklAPI_Datas.py:633](nakalapycon/src/nklAPI_Datas.py#L633)) est documenté « Ajout d'une nouvelle métadonnée » **sans avertir** qu'employer cette fonction pour « corriger » un titre **ajoute un second titre**. L'utilisateur corrompt sa notice sans erreur (code `201` renvoyé, conforme).
+
+À l'inverse, `delete_datas_metadatas` ([nklAPI_Datas.py:704](nakalapycon/src/nklAPI_Datas.py#L704)) est **correct et utile** : il accepte un filtre dans le corps (ex. `{"lang":"en","propertyUri":".../subject"}`) → suppression **granulaire à la valeur**, conforme au comportement réel (DELETE granulaire → 200). Recommandation : documenter le motif « DELETE puis POST » pour éditer un scalaire.
 
 ---
 
@@ -411,3 +480,242 @@ Aucun champ n'est marqué `required` au niveau du schéma (Nakala valide les mé
 - **Droits data** : enum `Role` = `[ROLE_ADMIN, ROLE_EDITOR, ROLE_READER]` ; `ROLE_OWNER` non assignable → **3.18**.
 - **`collectionsIds`** : schéma brut `{"type": "string", "example": ["10.34847/nkl.12345678"]}` — spec **auto-incohérente** (type `string` mais exemple tableau) ; le code envoie un tableau (= l'exemple) → **code correct**.
 - **Dates** : sur une data publiée réelle (`10.34847/nkl.be633595`), `GET …/metadatas` montre `created`, `title`, `license`, `creator` avec **`typeUri = null`** ; seul `type` porte `dcterms:URI`. → Nakala ne pose pas de `typeUri` sur `created` en pratique ; `xsd:string` (code) n'est conforme ni à cet usage ni à `W3CDTF` (cf. **3.16**).
+
+### 8.8 Créateurs (noms/prénoms) — API vs NakalaPycon (script `C:\temp\nkl_creator.py`)
+- **Modèle API** : définition `Author` = `{givenname, surname, orcid, authorId, fullName}`, `givenname`+`surname` **obligatoires** ; données réelles confirmées (`{"givenname":"Claudie","surname":"Marcel-Dubois","fullName":"Claudie Marcel-Dubois"}`).
+- **Regex NakalaPycon** : lit **« Nom, Prénom »** (`"Dupont, Pierre"` → surname=Dupont, givenname=Pierre) ⇒ **contredit le docstring** « prénom, nom » (cf. 3.11).
+- **Effets de bord** : espace parasite dans `givenname` après `@orcid` ; créateur **sans virgule silencieusement ignoré** (`"Marie Curie"` → omis).
+- **Site vs API** : le formulaire du site a deux champs séparés (pas d'inversion) ; la lib découpe une chaîne unique (inversion/omission possibles). Format stocké identique des deux côtés.
+- **Confirmé par cas réel** : `10.34847/nkl.3d6bm8n2` stocke `givenname="Manet", surname="Eduardo"` (pour Eduardo Manet) — exemple concret d'inversion déjà présente dans l'entrepôt.
+- **Note search** : `GET /search` renvoie les `metas` creator avec `value: null` (l'info auteur est exposée hors `metas` dans la réponse search) — à ne pas parser depuis là.
+
+### 8.9 `authorId` — test d'écriture sur l'instance de test (script `C:\temp\nkl_authorid2.py`)
+Test réel : 3 data *pending* créées puis **supprimées** (3× DELETE 204), avec le même auteur dans deux ordres.
+
+| Dépôt | Couple envoyé | `authorId` |
+|-------|---------------|-----------|
+| A1 | `{givenname:"Zephyrin", surname:"Qwxtestauthor"}` | `03664163-…96793` |
+| A2 | idem A1 | `03664163-…96793` (**identique**) |
+| B  | `{givenname:"Qwxtestauthor", surname:"Zephyrin"}` (inversé) | `959ba842-…7a3c` (**différent**) |
+
+**Conclusions prouvées :**
+1. **A1 == A2** → Nakala **dédoublonne** : un couple `(givenname, surname)` identique réutilise le même `authorId` (regroupement d'auteurs côté serveur).
+2. **A1 ≠ B** → le dédoublonnage se fait sur le **couple ordonné exact** ; l'inversion prénom/nom crée un **auteur distinct** (pas de normalisation, pas de test d'inversion, pas d'usage du `fullName`).
+
+**Aggrave 3.11** : une inversion par `creatorsValuesToDic` ne produit pas seulement un affichage erroné — elle **détache le créateur de l'identité d'auteur** de Nakala (nouvel `authorId`). En dépôt de masse, cela **fragmente silencieusement** les auteurs (même personne éclatée en plusieurs `authorId`), dégradant recherche et pages auteur. L'impact de 3.11 est donc à relever : effet sur l'intégrité des données, pas seulement cosmétique.
+
+### 8.10 Génération d'index & exemples réels de créateurs (scripts `nkl_index.py`, `nkl_one*.py`)
+
+**Tri de l'index côté Nakala** — `GET /authors/search?order=asc` : tri primaire **par `givenname`**
+(conforme à la doc « basé le prénom puis le nom »). De plus, une large part des fiches ont
+`givenname=""` et tout le libellé dans `surname` (ex. `surname="Jean Daudin"`), ce qui rend le
+classement hétérogène. → Côté API comme côté NakalaPycon (§3.19), la clé alphabétique part du
+**prénom**, pas du nom de famille.
+
+**Exemples réels confrontés à l'API :**
+
+| DOI | `givenname` | `surname` | Lecture |
+|-----|-------------|-----------|---------|
+| `10.34847/nkl.3d6bm8n2` (« Alicia ») | `Manet` | `Eduardo` | **inversé** : l'auteur visé est Eduardo Manet ; nom et prénom permutés, `authorId=60290a13-…` propre à cette forme inversée → fiche d'auteur fragmentée |
+| `10.34847/nkl.30adw69k` (« Un duo d'artistes atypique ») | — | — | `creator.value = null` : propriété présente mais **aucune donnée d'auteur** ; rien à indexer ⇒ entrée « sans auteur » |
+| `10.34847/nkl.be633595` | `Claudie` | `Marcel-Dubois` | correct (référence saine) |
+
+➡️ Ces cas illustrent les trois états rencontrés en production : créateur **correct**, créateur
+**inversé** (signature du scénario 3.11/3.19), créateur **vide** (`null`). Un index généré
+mélange donc tri-par-prénom, entrées permutées et lignes sans auteur — sans que l'outil ne
+distingue ces situations.
+
+### 8.11 Pagination /search, IIIF, et réparabilité de l'authorId (scripts `nkl_more.py`, `nkl_repair.py`)
+
+**Pagination `/search`** (lecture seule) :
+- `size` honoré jusqu'à `10000` (status 200, `nb_datas` = `size`) ; `page=1` vs `page=2` renvoient des `identifier` distincts → pagination fonctionnelle.
+- **Mais** `lastPage` et `currentPage` sont **`null`** dans la réponse `/search` (seul `totalResults` ≈ 898 413 est présent) → cf. 3.20.
+
+**IIIF** (lecture seule, image publique `10.34847/nkl.f1ea3017` / `ebe638b…3119b`) :
+- `info.json` → 200, `width=971 height=849` (conforme à l'assertion de `test_nklPullCorpus`), `@context = .../image/3/context.json` (**API 3.0**).
+- URL `…/0,0,100,100/full/0/default.jpg` → 200, `4675` octets, magie `FF D8 FF E0` = **JPEG valide** → `full` encore toléré (cf. 3.21).
+
+**Réparabilité de l'`authorId` via `put_datas`** (test d'écriture instance de test, 2 data créées puis supprimées — 2× DELETE 204) :
+
+| Étape | `givenname` / `surname` | `authorId` |
+|-------|-------------------------|-----------|
+| Créé **inversé** | Manettest / Eduardo | `d4692916-…49b8` |
+| **Après `put_datas`** correctif | Eduardo / Manettest | `b6d3ebf9-…9ef2` |
+| **Référence** (créée correcte) | Eduardo / Manettest | `b6d3ebf9-…9ef2` |
+
+➡️ **Conclusions** : `put_datas` **recalcule** l'`authorId` (≠ avant), et la valeur corrigée est **identique à la référence**. Le dédoublonnage de Nakala est donc **dynamique** (recalculé à chaque écriture sur le couple courant, sans mémoire de l'ancien). **Bonne nouvelle pour la remédiation** : corriger une inversion via l'API rattache réellement la donnée à la bonne fiche d'auteur — pas de fantôme résiduel sur la donnée corrigée (l'ancien `authorId` ne subsiste que s'il reste référencé par d'autres data). Complète §8.9.
+
+---
+
+## 9. Cartographie envoi / extraction & dette
+
+Vue synthétique de **toutes** les fonctions du paquet, classées par **sens**
+(envoi vers Nakala / extraction depuis Nakala) et par **état**. Les lignes
+« manquant » s'appuient sur le catalogue d'endpoints réels de Nakala (savoir
+live ColleC, `nakala-savoir-api.md`). Objectif : visualiser d'un coup où sont
+les trous et la dette avant toute feuille de route.
+
+**Légende :** ✅ présent & sain · 🐞 bug fonctionnel · ⚠️ fragile (stub partiel /
+perf / doc / conformité) · ❌ capacité Nakala non exposée. Les réfs (2.x, 3.x)
+pointent les sections de cet audit.
+
+### 9.1 Envoi (écriture) — couverture quasi complète, justesse inégale
+
+**Dépôts & fichiers**
+
+| Fonction | État | Note |
+|----------|------|------|
+| `post_datas` (créer) | ✅ | exposé au #422 si `metas` portent une `lang` 639-3 (3.22) |
+| `put_datas` | ⚠️ | danger `files[]` = remplacement total non documenté (3.23) |
+| `delete_datas` | ⚠️ | ignore le succès `202` (3.5) |
+| `post_datas_uploads` | 🐞 | fuite de descripteur + `open()` hors `except` (3.13) |
+| `delete_datas_uploads` | ✅ | |
+| `post_datas_files` | ✅ | commentaire « 201 » faux, cosmétique (3.5) |
+| `delete_datas_files` | 🐞 | **cassée** : U+200B dans l'URL + teste `200`≠`204` (2.4) |
+
+**Métadonnées / droits / appartenance / publication**
+
+| Fonction | État | Note |
+|----------|------|------|
+| `post_datas_metadatas` | ⚠️ | `Content-Type` absent (3.14) + doublon-sur-scalaire non documenté (3.24) |
+| `delete_datas_metadatas` | ✅ | granulaire à la valeur, correct |
+| `post_datas_rights` | ⚠️ | `Content-Type` absent (3.14) + docstring `ROLE_OWNER` erroné (3.18) |
+| `delete_datas_rights` | ✅ | |
+| `post_datas_collections` | ⚠️ | `Content-Type` absent (3.14) |
+| `delete_datas_collections` | ✅ | |
+| `put_datas_status` | ⚠️ | fige `"published"` — autres statuts non exposés |
+| `PUT …/collections` (remplacer appartenance) | ❌ | seuls post/delete existent |
+
+**Collections & groupes**
+
+| Fonction | État | Note |
+|----------|------|------|
+| `post_collections` / `put_collections` / `delete_collections` / `post_collections_datas` | ✅ | CRUD collection complet |
+| metadatas / rights / status **granulaires** de collection | ❌ | non exposés |
+| `post_groups` / `put_groups` | 🐞 | `users` en liste de chaînes au lieu d'objets `{username,role}` (3.17) |
+| `delete_groups` | ✅ | |
+
+**Helpers d'envoi (haut niveau)**
+
+| Fonction | État | Note |
+|----------|------|------|
+| `dfDatasFiles2ListDic` (tableur→JSON) | 🐞 | conditions pandas `len(df==1)` (2.5) + langue jamais posée (2.6) |
+| `creatorsValuesToDic` | 🐞 | inversion nom/prénom (3.11) + séparateurs ignorés (3.7) |
+| `put_collections_datas_rights` | ⚠️ | `limit=1` → N+1 requêtes (5.13) |
+| `delete_datas_uploads_all` | ⚠️ | n'inspecte pas `isSuccess` (5.11) |
+
+**Encodage d'envoi manquant**
+
+| Capacité | État |
+|----------|------|
+| Conversion langue 639-3→639-1 | ❌ (cause du #422, 3.22) |
+| `build_spatial` / `build_temporal` (DCSV) | ❌ |
+| Validation licence SPDX (∪ extras type `etalab-2.0`) | ❌ |
+| `relations` POST/DELETE (+ vocabulaire fermé de 38 types) | ❌ |
+
+➡️ **Lecture 9.1** : la surface d'envoi **existe quasi intégralement** ; la dette
+est de la **justesse** (1 fonction cassée, ~6 bugs, `Content-Type`, conformité
+groupes) + quelques **helpers d'encodage** absents. Peu de capacités *nouvelles*
+à créer — surtout corriger.
+
+### 9.2 Extraction (lecture) — GET bas niveau sains, couche corpus faible
+
+**GET bas niveau (sains)**
+
+| Fonction | État | Note |
+|----------|------|------|
+| `get_datas` (+ `metadataFormat`) | ✅ | |
+| `get_datas_files` / `_metadatas` / `_rights` / `_collections` / `_status` / `_uploads` | ✅ | |
+| `get_iiif_infoJson` | ✅ | seul endroit où `json.loads` est protégé |
+| `get_collections` / `get_collections_datas` | ✅ | collection fournit `lastPage` → pagination OK ici |
+| `get_groups` / `get_users_me` | ✅ | |
+| `get_vocabularies_*` (×5) | ✅ | sauf `get_vocabularies_languages` : params non encodés (2.3) ⚠️ |
+
+**Recherche (la plus boguée)**
+
+| Fonction | État | Note |
+|----------|------|------|
+| `get_search_datas` | 🐞 | `order` ignoré (2.1) + **crash** sur réponse ≠200 (3.3) + `size`/pagination non exposés (3.12/3.20) + params non encodés (2.3) |
+| `get_search_authors` | 🐞 | `order`/`page`/`limit` ignorés (2.2) + params non encodés |
+| `search_groups` | ⚠️ | params non encodés (2.3) |
+
+**Helpers de lecture (`nklUtils`)**
+
+| Fonction | État | Note |
+|----------|------|------|
+| `isFileNameInData` / `isFileNameInUploads` | ✅ | |
+| `isFileSha1InData` | 🐞 | retour `None` implicite (2.8) |
+| `isFileSha1InUploads` | ⚠️ | renvoie `bool` au lieu d'un tuple (incohérent, 5.3) |
+
+**Couche corpus (`nklPullCorpus`) — le maillon faible**
+
+| Fonction | État | Note |
+|----------|------|------|
+| `collectionToDf` | ⚠️ | **stub** (`pass`) + test l'appelle avec 1 arg → `TypeError` (3.8) |
+| `collectionDatasToDf` | 🐞 | n'extrait que **5 `propertyUri`** (title/created/license/type/creator) alors que sa docstring promet « toutes les metas » → spatial/temporal/subject/description/contributor/language… **silencieusement perdus** ; créateurs aplatis à perte ; `pd.concat` en boucle (3.8, 3.19, 3.10) |
+| `getImageSize` | ⚠️ | `except:` nu → `(0,0)` silencieux (5.11) |
+| `getImageUrlIIIF` | ⚠️ | `size="full"` déprécié en IIIF 3.0 (3.21) |
+| `getSoundTimeDuration` | ⚠️ | **stub** (`return 0`) |
+
+> **Constat groupé — la couche « transformation vers DataFrame » est inachevée.**
+> Les deux seules fonctions « vers df » (le cœur « pull corpus » du paquet) ne
+> sont pas terminées : `collectionToDf` est un **stub** pur (`# TODO` + `pass` →
+> `None`, jamais implémentée) et `collectionDatasToDf` est **partielle** — elle
+> n'extrait que 5 `propertyUri` sur tout le Dublin Core alors que sa docstring
+> annonce « toutes les metas » (toute métadonnée riche — spatial, temporal,
+> subject, description, contributor, language, relations… — est **silencieusement
+> perdue à l'aplatissement**, alors que `get_collections_datas` la renvoie bien
+> en amont). Avec `getSoundTimeDuration` (stub) en plus, c'est **2 stubs sur 5
+> fonctions** du module + des fonctionnelles boguées. Le défaut n'est donc ni
+> « une docstring à corriger » ni « les créateurs aplatis » (3.19) pris
+> isolément : c'est **toute la couche d'extraction tabulaire qui est en
+> chantier**. Correctif de fond = **boucle générique** sur toutes les
+> `propertyUri` + **décision de représentation tabulaire** du riche / répétable /
+> structuré (colonne DCSV brute, colonnes éclatées, ou table « longue »),
+> idéalement avec `parse_spatial`/`parse_temporal` pour décoder le DCSV. Lien :
+> 3.8, 3.10, 3.19, 3.21, 9.4.
+
+**Capacités d'extraction manquantes**
+
+| Capacité | État |
+|----------|------|
+| `GET …/citation` | ❌ |
+| `GET …/versions` + résolution `.vN` | ❌ |
+| `GET …/relations` | ❌ |
+| `GET /resourceprocessing/{id}` | ❌ |
+| Téléchargement binaire direct `GET /data/{id}/{sha1}` | ❌ (IIIF seulement) |
+| **OAI-PMH `/oai2`** (moissonnage, sets = collections) | ❌ |
+| Facettes users (`/users/datas/{datatypes,statuses,createdyears}`) | ❌ |
+| `/websites`, `/embed/{id}/{fileId}` | ❌ |
+| **Itérateur « tout paginer »** (`/search` via `totalResults`+`size`) | ❌ |
+| Lecteurs structurés (créateur fidèle, `parse_spatial/temporal`) | ❌ |
+| Détection de dérive via `modDate` | ❌ |
+
+➡️ **Lecture 9.2** : les GET bas niveau sont sains, mais **la recherche est
+boguée** et **la couche corpus — la vocation affichée « pull corpus »** — est la
+plus faible du projet (2 stubs, extraction à perte, IIIF déprécié). C'est là que
+se concentrent à la fois la **dette** et les **capacités nouvelles** à plus fort
+rapport valeur/effort.
+
+### 9.3 Socle (transverse) — dette systémique
+
+| Élément | État | Note |
+|---------|------|------|
+| `NklTarget` défaut `apiKey` non vide | 🐞 | faux positif d'auth → 401 (2.7) |
+| `_request()` factorisé | ❌ | absent → boilerplate ×30 (5.1), cause-racine de 2.3/3.1/3.2 |
+| `timeout` réseau | ❌ | absent partout (3.2) |
+| `json.loads` protégé | 🐞 | non protégé sauf `get_iiif_infoJson` (3.1) |
+| Retry 5xx / vérif DELETE par relecture | ❌ | pertinent surtout en prod (TLS timeouts, 500 transitoires) |
+| `logging` au lieu de `print` | 🐞 | `print` dans toute la lib (3.4) |
+| Imports relatifs / packaging | ⚠️ | imports absolus de 1er niveau (5.10) |
+| Type hints / dataclasses | ❌ | |
+
+### 9.4 Lecture d'ensemble
+
+- **Envoi** : ~complet en couverture, **dette = justesse** (corriger > créer).
+- **Extraction** : GET bas niveau sains, mais **recherche boguée** et **couche
+  corpus sous-développée** → l'axe au meilleur rapport valeur/effort pour des
+  **capacités nouvelles** (moissonnage, lecteurs fidèles, versions/citation).
+- **Socle** : un seul chantier (`_request()` + `timeout` + `json` protégé + clé
+  vide) **éteint en cascade** une grande partie des bugs des deux côtés — c'est
+  le préalable rentable.
